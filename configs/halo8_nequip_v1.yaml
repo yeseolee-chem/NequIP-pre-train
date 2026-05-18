@@ -1,0 +1,90 @@
+# Halo8 NequIP pretraining config (Spec §4)
+root: output/halo8_nequip_v1/
+run_name: halo8_nequip_v1
+seed: 42
+dataset_seed: 42
+
+# Dataset
+dataset: ase
+dataset_file_name: output/halo8_nequip_v1/data/halo8_train.extxyz
+validation_dataset: ase
+validation_dataset_file_name: output/halo8_nequip_v1/data/halo8_val.extxyz
+chemical_symbols: [H, C, N, O, F, Cl, Br]
+key_mapping:
+  energy: total_energy
+  forces: forces
+
+# Model
+model_builders:
+  - SimpleIrrepsConfig
+  - EnergyModel
+  - PerSpeciesRescale
+  - ForceOutput
+  - RescaleEnergyEtc
+
+num_layers: 4
+l_max: 2
+parity: true
+num_features: 64
+nonlinearity_type: gate
+resnet: true
+
+r_max: 5.0
+num_basis: 8
+BesselBasis_trainable: true
+PolynomialCutoff_p: 6
+avg_num_neighbors: auto
+
+invariant_layers: 2
+invariant_neurons: 64
+
+# Loss
+loss_coeffs:
+  forces: 1.0
+  total_energy:
+    - 1.0
+    - PerAtomMSELoss
+
+# Optimizer
+optimizer_name: Adam
+learning_rate: 5.0e-3
+optimizer_amsgrad: false
+optimizer_betas: [0.9, 0.999]
+optimizer_eps: 1.0e-8
+optimizer_weight_decay: 0.0
+
+lr_scheduler_name: ReduceLROnPlateau
+lr_scheduler_patience: 50
+lr_scheduler_factor: 0.5
+lr_scheduler_threshold: 1.0e-3
+lr_scheduler_min_lr: 1.0e-6
+
+use_ema: true
+ema_decay: 0.99
+ema_use_num_updates: true
+
+# Training
+batch_size: 32
+validation_batch_size: 64
+max_epochs: 200
+shuffle: true
+metrics_key: validation_loss
+early_stopping_lower_bounds:
+  LR: 1.0e-6
+early_stopping_patiences:
+  validation_loss: 100
+
+# Checkpointing (critical: never reduce frequency)
+save_checkpoint_freq: 1
+save_ema_checkpoint_freq: 1
+n_save_keep: 3
+log_epoch_freq: 1
+log_batch_freq: 100
+
+# Logging
+verbose: info
+wandb: false
+wandb_project: halo8_nequip_pretrain
+wandb_resume: allow
+code_folder_name: ./nequip_code_snapshot
+append: true
