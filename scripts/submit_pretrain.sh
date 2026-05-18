@@ -3,7 +3,6 @@
 
 #SBATCH --job-name=halo8_nequip
 #SBATCH --partition=gpu1
-#SBATCH --nodelist=n007
 #SBATCH --gres=gpu:rtx3090:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
