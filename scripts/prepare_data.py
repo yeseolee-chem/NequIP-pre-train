@@ -230,6 +230,11 @@ def main() -> int:
         "--val-target-frames", type=int, default=VAL_TARGET_FRAMES,
         help=f"Target total validation frames (default {VAL_TARGET_FRAMES}).",
     )
+    parser.add_argument(
+        "--train-frames-per-rxn", type=int, default=300,
+        help="linspace endpoint-preserving subsample of training frames per "
+             "reaction (default 300). Use 0 to keep all frames (full v5 spec).",
+    )
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
 
@@ -267,12 +272,16 @@ def main() -> int:
     (DATA / "train_rxn_ids.json").write_text(json.dumps(sorted(train_rxns)))
     (DATA / "val_rxn_ids.json").write_text(json.dumps(sorted(val_rxns)))
 
-    # ---- First sweep: collect frame_idx list per val reaction ----
+    # ---- First sweep: collect frame_idx list per train+val reaction ----
     # Review §2.3: skip non-f0_passed rows up front so we don't pay the
     # parse cost for ~13M rows that won't be used.
-    print("[prepare_data] sweep 1/2: collecting val reaction frame_idx lists...")
+    # Train frames are linspace-subsampled per reaction so that 17.6M raw
+    # frames fit on the user's ~82 GB GPFS quota (each reaction keeps an
+    # evenly-spaced subset that still covers R, TS, and P regions).
+    print("[prepare_data] sweep 1/2: collecting train+val reaction frame_idx lists...")
+    train_frame_indices: dict[str, list[int]] = defaultdict(list)
     val_frame_indices: dict[str, list[int]] = defaultdict(list)
-    n_pairs_v1 = 0
+    n_train_seen = n_val_seen = 0
     for shard in HALO8_SHARDS:
         if not shard.exists():
             continue
@@ -282,16 +291,38 @@ def main() -> int:
                     rid, fidx = derive_rxn_and_frame(row, rf_mode)
                 except Exception:
                     continue
-                if rid not in f0_passed:
-                    continue
-                if rid in val_rxns:
+                if rid in train_rxns:
+                    train_frame_indices[rid].append(fidx)
+                    n_train_seen += 1
+                elif rid in val_rxns:
                     val_frame_indices[rid].append(fidx)
-                    n_pairs_v1 += 1
-        print(f"  {shard.name}: cumulative val frames discovered = {n_pairs_v1}")
+                    n_val_seen += 1
+        print(f"  {shard.name}: cum train_pool={n_train_seen}, val_pool={n_val_seen}")
 
     # ---- linspace endpoint-preserving stride per reaction ----
+    # Train: per-reaction target (CLI arg). 0 → keep all (full v5 spec).
+    train_keep_set: dict[str, set[int]] = {}
+    n_train_kept_planned = 0
+    for rxn_id, frames in train_frame_indices.items():
+        frames.sort()
+        total = len(frames)
+        if args.train_frames_per_rxn <= 0 or args.train_frames_per_rxn >= total:
+            train_keep_set[rxn_id] = set(frames)
+            n_train_kept_planned += total
+        else:
+            positions = np.linspace(0, total - 1, args.train_frames_per_rxn, dtype=int)
+            positions = np.unique(positions)
+            train_keep_set[rxn_id] = {frames[p] for p in positions}
+            n_train_kept_planned += len(positions)
+    train_pool_total = sum(len(v) for v in train_frame_indices.values())
+    print(f"[prepare_data] train: pool={train_pool_total}, "
+          f"target_frames_per_rxn={args.train_frames_per_rxn or 'ALL'}, "
+          f"planned_keep={n_train_kept_planned} "
+          f"({100.0 * n_train_kept_planned / max(1, train_pool_total):.1f}%)")
+
+    # Val: keep target_total/n_val_rxns per reaction.
     val_frames_per_rxn = max(1, args.val_target_frames // max(1, len(val_rxns)))
-    print(f"[prepare_data] target frames/val_rxn = {val_frames_per_rxn} "
+    print(f"[prepare_data] val: pool={n_val_seen}, target_frames_per_rxn={val_frames_per_rxn} "
           f"(target_total={args.val_target_frames}, n_val_rxns={len(val_rxns)})")
     val_keep_set: dict[str, set[int]] = {}
     for rxn_id, frames in val_frame_indices.items():
@@ -354,13 +385,26 @@ def main() -> int:
                 except Exception:
                     n_skip += 1
                     continue
-                if rid not in f0_passed:
-                    continue
+                # Decide which split & whether this frame survives subsampling
+                # BEFORE the (expensive) toatoms() call.
+                if rid in train_rxns:
+                    if fidx not in train_keep_set.get(rid, set()):
+                        continue
+                    target_buf = train_buf
+                    target_path = TRAIN_PATH
+                    is_train = True
+                elif rid in val_rxns:
+                    if fidx not in val_keep_set.get(rid, set()):
+                        continue
+                    target_buf = val_buf
+                    target_path = VAL_PATH
+                    is_train = False
+                else:
+                    continue  # not in f0_passed
 
                 # Review §2.4: schema probe ran on the first row only; an
                 # anomalous row mid-stream would otherwise crash the whole
-                # sweep. Tolerate a few skips; abort if it exceeds a
-                # threshold (likely a real schema regression).
+                # sweep. Tolerate a few skips; abort if it exceeds a threshold.
                 try:
                     atoms, energy, forces = extract_data(row, ef_mode)
                 except Exception as e:  # noqa: BLE001
@@ -375,18 +419,13 @@ def main() -> int:
                 atoms.calc = SinglePointCalculator(atoms, energy=energy, forces=forces)
                 atoms.info["reaction_id"] = rid
                 atoms.info["frame_idx"] = fidx
-
-                if rid in train_rxns:
-                    train_buf.append(atoms)
+                target_buf.append(atoms)
+                if is_train:
                     n_train_frames += 1
-                    if len(train_buf) >= CHUNK:
-                        flush(train_buf, TRAIN_PATH)
-                elif rid in val_rxns:
-                    if fidx in val_keep_set.get(rid, set()):
-                        val_buf.append(atoms)
-                        n_val_frames += 1
-                        if len(val_buf) >= CHUNK:
-                            flush(val_buf, VAL_PATH)
+                else:
+                    n_val_frames += 1
+                if len(target_buf) >= CHUNK:
+                    flush(target_buf, target_path)
         flush(train_buf, TRAIN_PATH)
         flush(val_buf, VAL_PATH)
         print(f"  {shard.name}: cum train={n_train_frames}, val={n_val_frames}, "
@@ -426,6 +465,10 @@ def main() -> int:
         "n_val_frames": n_val_frames,
         "n_train_reactions": len(train_rxns),
         "n_val_reactions": len(val_rxns),
+        "train_frames_per_rxn_target": args.train_frames_per_rxn or "ALL",
+        "train_sampling_method": "numpy_linspace_endpoint_preserving" if args.train_frames_per_rxn else "all_frames",
+        "train_pool_total": train_pool_total,
+        "train_keep_ratio": n_train_frames / max(1, train_pool_total),
         "val_frames_per_rxn_target": val_frames_per_rxn,
         "val_sampling_method": "numpy_linspace_endpoint_preserving",
         "val_frame_idx_median": float(np.median(all_kept)) if all_kept else None,
