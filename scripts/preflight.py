@@ -17,7 +17,11 @@ from pathlib import Path
 
 PROJECT = Path(__file__).resolve().parents[1]
 WORK = PROJECT / "output" / "halo8_nequip_v1"
-HALO8_DB_DIR = Path("/gpfs/home1/yeseo1ee/projects/ts_prediction_project/data")
+# Match the override pattern in prepare_data.py (Review §2.5 — DRY).
+HALO8_DB_DIR = Path(os.environ.get(
+    "HALO8_DB_DIR",
+    "/gpfs/home1/yeseo1ee/projects/ts_prediction_project/data",
+))
 F0_PATH = PROJECT / "data" / "halo8_F0_passed.json"
 SCHEMA_PROBE = WORK / "data" / "halo8_schema_probe.txt"
 

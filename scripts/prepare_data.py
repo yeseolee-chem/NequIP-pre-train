@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import random
 import sys
 import time
@@ -40,12 +41,17 @@ WORK = PROJECT / "output" / "halo8_nequip_v1"
 DATA = WORK / "data"
 DATA.mkdir(parents=True, exist_ok=True)
 
-HALO8_DB_DIR = Path("/gpfs/home1/yeseo1ee/projects/ts_prediction_project/data")
+# Override either path via env vars if the data moves.
+HALO8_DB_DIR = Path(os.environ.get(
+    "HALO8_DB_DIR",
+    "/gpfs/home1/yeseo1ee/projects/ts_prediction_project/data",
+))
 HALO8_SHARDS = [HALO8_DB_DIR / f"Halo_{i}.db" for i in range(1, 11)]
 F0_PATH = PROJECT / "data" / "halo8_F0_passed.json"
-INDEX_PARQUET = Path(
-    "/gpfs/home1/yeseo1ee/projects/eda-asm-prediction/data/halo8_index/index.parquet"
-)
+INDEX_PARQUET = Path(os.environ.get(
+    "HALO8_INDEX_PARQUET",
+    "/gpfs/home1/yeseo1ee/projects/eda-asm-prediction/data/halo8_index/index.parquet",
+))
 BOND_PARQUET = INDEX_PARQUET.with_name("bond_changes_all.parquet")
 
 TRAIN_PATH = DATA / "halo8_train.extxyz"
@@ -262,6 +268,8 @@ def main() -> int:
     (DATA / "val_rxn_ids.json").write_text(json.dumps(sorted(val_rxns)))
 
     # ---- First sweep: collect frame_idx list per val reaction ----
+    # Review §2.3: skip non-f0_passed rows up front so we don't pay the
+    # parse cost for ~13M rows that won't be used.
     print("[prepare_data] sweep 1/2: collecting val reaction frame_idx lists...")
     val_frame_indices: dict[str, list[int]] = defaultdict(list)
     n_pairs_v1 = 0
@@ -273,6 +281,8 @@ def main() -> int:
                 try:
                     rid, fidx = derive_rxn_and_frame(row, rf_mode)
                 except Exception:
+                    continue
+                if rid not in f0_passed:
                     continue
                 if rid in val_rxns:
                     val_frame_indices[rid].append(fidx)
@@ -347,7 +357,21 @@ def main() -> int:
                 if rid not in f0_passed:
                     continue
 
-                atoms, energy, forces = extract_data(row, ef_mode)
+                # Review §2.4: schema probe ran on the first row only; an
+                # anomalous row mid-stream would otherwise crash the whole
+                # sweep. Tolerate a few skips; abort if it exceeds a
+                # threshold (likely a real schema regression).
+                try:
+                    atoms, energy, forces = extract_data(row, ef_mode)
+                except Exception as e:  # noqa: BLE001
+                    n_skip += 1
+                    if n_skip <= 10:
+                        print(f"  [skip] row id={getattr(row, 'id', '?')}: {e}")
+                    if n_skip > 1000:
+                        raise RuntimeError(
+                            f"extract_data failed for >1000 rows — schema regression?"
+                        ) from e
+                    continue
                 atoms.calc = SinglePointCalculator(atoms, energy=energy, forces=forces)
                 atoms.info["reaction_id"] = rid
                 atoms.info["frame_idx"] = fidx
