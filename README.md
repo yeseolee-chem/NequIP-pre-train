@@ -1,11 +1,21 @@
-# Halo8 NequIP Pre-training
+# Halo8 NequIP Pre-training (Spec v5)
 
 Pre-training pipeline for a NequIP MLIP backbone on the Halo8 reaction
-trajectory dataset (≈17k reactions, millions of frames). Built per the
-operational spec in [`docs/Halo8_NequIP_Pretrain_Spec.md`](docs/Halo8_NequIP_Pretrain_Spec.md).
+trajectory dataset. Implements the v5 operational spec in
+[`docs/Halo8_NequIP_Pretrain_Spec_v5.md`](docs/Halo8_NequIP_Pretrain_Spec_v5.md).
 
-Auto-resubmitting SLURM driver, every-epoch checkpointing, idempotent data
-prep, and graceful SIGUSR1 shutdown so no more than 1 epoch is ever lost.
+Key v5 features:
+- Schema probe with public ASE API (`row.key_value_pairs.keys()`).
+- **`np.linspace` endpoint-preserving** validation-frame sampling — covers
+  reactant, TS, AND product regions.
+- Streaming extxyz write (peak RAM < 1 GB regardless of dataset size).
+- `n_train` / `n_val` injection into the NequIP config via ruamel.yaml
+  (comments preserved).
+- Python launcher (`scripts/nequip_launcher.py`) that flips TF32 ON
+  BEFORE importing nequip.
+- 48-hour-per-job SLURM driver with SIGUSR1 graceful resubmit, every-epoch
+  checkpoint.
+- Tiered tier check (`scripts/check_target_metrics.py`) in meV/atom.
 
 ## Layout
 
@@ -13,57 +23,32 @@ prep, and graceful SIGUSR1 shutdown so no more than 1 epoch is ever lost.
 halo8-nequip-pretrain/
 ├── configs/
 │   └── halo8_nequip_v1.yaml      # NequIP config (Spec §4)
-├── data/                          # F0-passed / V2-holdout JSONs (gitignored if generated)
+├── data/                          # F0-passed JSON (when provided)
 ├── scripts/
-│   ├── preflight.py               # hard env + data checks (Spec §1)
-│   ├── prepare_data.py            # reaction selection + extxyz writer (Spec §3)
-│   └── submit_pretrain.sh         # SLURM driver with auto-resubmit (Spec §6)
+│   ├── preflight.py
+│   ├── prepare_data.py            # v5 schema probe + linspace + stream + ruamel
+│   ├── nequip_launcher.py         # TF32-before-import wrapper
+│   ├── submit_pretrain.sh         # 48h SLURM, SIGUSR1 auto-resubmit
+│   ├── check_target_metrics.py    # 우수/합격/실패 tier classification
+│   ├── validate_output.py         # post-training manifest + asserts
+│   └── daily_check.py             # cron monitoring
 ├── output/
 │   └── halo8_nequip_v1/           # working dir, gitignored
-│       ├── checkpoints/           # best/last/epoch_NNN
-│       ├── data/                  # halo8_{train,val}.extxyz, hashes, split JSONs
-│       └── logs/                  # training.log + slurm/job-*.out
 └── docs/
-    └── Halo8_NequIP_Pretrain_Spec.md
+    ├── Halo8_NequIP_Pretrain_Spec_v5.md
+    └── SERVER_ACCESS_GUIDE.md
 ```
 
 ## Quick start
 
 ```bash
-# 1. Activate env (nequip 0.6.2 + torch 2.2.1+cu118 already installed in reactot)
 source /home1/yeseo1ee/miniconda3/etc/profile.d/conda.sh
-conda activate reactot
+conda activate reactot              # nequip 0.6.2 + torch 2.2.1 + ruamel.yaml 0.19
 
-# 2. Verify preflight
+python scripts/prepare_data.py      # ≈30–60 min (one-time)
 python scripts/preflight.py
-
-# 3. Submit (auto-resubmits up to MAX_RESUBMIT=50)
-sbatch scripts/submit_pretrain.sh
+sbatch scripts/submit_pretrain.sh   # chains via MAX_RESUBMIT=50
 ```
-
-## SLURM settings (defaults)
-
-| Setting | Value |
-|---|---|
-| `--partition` | `gpu1` (RTX3090) |
-| `--nodelist` | `n007` (or any idle gpu1 node) |
-| `--gres` | `gpu:rtx3090:1` |
-| `--cpus-per-task` | 8 |
-| `--mem` | 64G |
-| `--time` | 48:00:00 (max per single submission) |
-| `--signal` | `B:USR1@600` (T-10 min grace) |
-
-## Reaction selection
-
-1. If `data/halo8_F0_passed.json` exists, the file's reaction IDs are used.
-2. Otherwise the script reads `data/halo8_index/index.parquet` from the
-   sibling `eda-asm-prediction` project and filters reactions by
-   `interior_ts & !short_traj & n_components_R == 1`, then **deterministically
-   caps to 17,574 reactions (seed=42)** to match the spec's target count.
-3. If `data/v2_holdout_ids.json` exists, those reactions are removed.
-
-The exact set used is written to `output/halo8_nequip_v1/data/used_reaction_ids.json`
-with provenance metadata.
 
 ## Monitoring
 
@@ -71,24 +56,19 @@ with provenance metadata.
 squeue -u $USER -n halo8_nequip
 tail -f output/halo8_nequip_v1/logs/training.log
 cat output/halo8_nequip_v1/resubmit_count.txt
-ls output/halo8_nequip_v1/training_complete.flag 2>/dev/null && echo "COMPLETE"
+ls output/halo8_nequip_v1/training_complete.flag 2>/dev/null && echo COMPLETE
 ```
 
-See [`docs/SERVER_ACCESS_GUIDE.md`](docs/SERVER_ACCESS_GUIDE.md) for full
-shell-level monitoring commands.
+Full guide: [`docs/SERVER_ACCESS_GUIDE.md`](docs/SERVER_ACCESS_GUIDE.md).
 
-## Stopping criteria
+## Local notes
 
-Training halts (and `training_complete.flag` is created) when ANY of:
-- epoch ≥ 200 (`config.max_epochs`)
-- LR ≤ 1e-6 (`early_stopping_lower_bounds`)
-- 100 epochs without val_loss improvement
-- target metrics met (val energy MAE < 1 kcal/mol AND val force MAE < 0.05 eV/Å)
-- `touch training_complete.flag` (manual)
-
-To halt the auto-resubmit chain at any time:
-
-```bash
-touch output/halo8_nequip_v1/training_complete.flag
-scancel -u $USER -n halo8_nequip
-```
+- Halo8 shards under `/gpfs/home1/yeseo1ee/projects/ts_prediction_project/data/`
+  use the `row.data["dand_id"]` encoding for reaction_id + frame_idx;
+  `prepare_data.py` autodetects.
+- F0-passed list not present yet → fallback to a deterministic 17,574-reaction
+  subset from `eda-asm-prediction/data/halo8_index/index.parquet`
+  (seed=42, `interior_ts & !short_traj & n_components_R==1`). Drop the
+  real list at `data/halo8_F0_passed.json` and rerun with `--force` to
+  switch.
+- HPC walltime cap is 48 h per submission → relies on auto-resubmit.

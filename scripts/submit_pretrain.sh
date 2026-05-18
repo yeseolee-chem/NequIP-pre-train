@@ -1,17 +1,5 @@
 #!/bin/bash
-# Halo8 NequIP pretraining — auto-resubmitting SLURM driver (Spec §6).
-#
-# Submit with: sbatch scripts/submit_pretrain.sh
-#
-# Behaviour:
-#   - Activates reactot env (has nequip 0.6.2 + torch 2.2.1 + cu118).
-#   - Runs preflight (hard fail = no resubmit).
-#   - Runs prepare_data.py (idempotent — skips if already done).
-#   - Starts (or resumes) NequIP training.
-#   - On SIGUSR1 (T-10 min before timeout) gracefully stops training and
-#     submits the next job in the chain.
-#   - On normal completion, writes training_complete.flag and stops.
-#   - Honours MAX_RESUBMIT to break loops.
+# Halo8 NequIP pretraining — auto-resubmitting SLURM driver (Spec v5 §6).
 
 #SBATCH --job-name=halo8_nequip
 #SBATCH --partition=gpu1
@@ -37,7 +25,6 @@ RESUBMIT_DELAY_ON_CRASH=120
 mkdir -p "$WORK_DIR/logs/slurm" "$WORK_DIR/checkpoints"
 cd "$PROJECT_DIR"
 
-# ---------- Resubmit counter ----------
 [ -f "$COUNT_FILE" ] || echo "0" > "$COUNT_FILE"
 COUNT=$(cat "$COUNT_FILE")
 echo "[$(date)] === halo8_nequip job start (resubmit #$COUNT / $MAX_RESUBMIT) ==="
@@ -51,12 +38,13 @@ if [ "$COUNT" -ge "$MAX_RESUBMIT" ]; then
     exit 1
 fi
 
-# ---------- Environment ----------
 source /home1/yeseo1ee/miniconda3/etc/profile.d/conda.sh
 conda activate reactot
 echo "[$(date)] python=$(which python)  nequip-train=$(which nequip-train)"
 
-# ---------- SIGUSR1 graceful exit ----------
+# TF32 — propagated to the launcher
+export NEQUIP_ENABLE_TF32=1
+
 TRAIN_PID=""
 graceful_exit() {
     echo "[$(date)] === SIGUSR1 received — graceful shutdown ==="
@@ -65,9 +53,9 @@ graceful_exit() {
         wc=0
         while kill -0 "$TRAIN_PID" 2>/dev/null; do
             sleep 5
-            wc=$((wc+1))
+            wc=$((wc + 1))
             if [ $wc -ge 96 ]; then
-                echo "[$(date)] WARNING: NequIP did not exit within 8min, force kill"
+                echo "[$(date)] WARNING: nequip did not exit within 8min, force kill"
                 kill -SIGKILL "$TRAIN_PID" 2>/dev/null || true
                 break
             fi
@@ -87,21 +75,18 @@ graceful_exit() {
 }
 trap graceful_exit SIGUSR1
 
-# ---------- Preflight ----------
 echo "[$(date)] preflight..."
 python "$PROJECT_DIR/scripts/preflight.py" || {
     echo "[$(date)] preflight failed — NOT resubmitting"
     exit 2
 }
 
-# ---------- Data preparation (idempotent) ----------
-echo "[$(date)] prepare_data..."
+echo "[$(date)] prepare_data (idempotent)..."
 python "$PROJECT_DIR/scripts/prepare_data.py" || {
     echo "[$(date)] prepare_data failed — NOT resubmitting"
     exit 3
 }
 
-# ---------- Resume vs fresh ----------
 CHECKPOINT="$WORK_DIR/checkpoints/last.ckpt"
 RESTART_FLAG=""
 if [ -f "$CHECKPOINT" ]; then
@@ -109,24 +94,25 @@ if [ -f "$CHECKPOINT" ]; then
     RESTART_FLAG="--restart $CHECKPOINT"
 else
     echo "[$(date)] starting fresh"
+    # record git SHA at fresh start for provenance
+    git -C "$PROJECT_DIR" rev-parse HEAD > "$WORK_DIR/code_sha.txt" 2>/dev/null \
+        || echo "unknown" > "$WORK_DIR/code_sha.txt"
 fi
 
-# ---------- GPU sanity ----------
 nvidia-smi || true
 
-# ---------- Launch ----------
-echo "[$(date)] launching nequip-train..."
+echo "[$(date)] launching nequip_launcher.py..."
 cd "$WORK_DIR"
 # shellcheck disable=SC2086
-nequip-train $RESTART_FLAG "$CONFIG" > "$WORK_DIR/logs/training.log" 2>&1 &
+python "$PROJECT_DIR/scripts/nequip_launcher.py" $RESTART_FLAG "$CONFIG" \
+    > "$WORK_DIR/logs/training.log" 2>&1 &
 TRAIN_PID=$!
-echo "[$(date)] nequip pid=$TRAIN_PID"
+echo "[$(date)] nequip launcher pid=$TRAIN_PID"
 
 wait $TRAIN_PID
 EXIT_CODE=$?
 echo "[$(date)] nequip exited with code $EXIT_CODE"
 
-# ---------- Completion check ----------
 if [ -f "$DONE_FLAG" ]; then
     echo "[$(date)] DONE_FLAG present — stopping chain"
     exit 0
@@ -138,7 +124,7 @@ if grep -q "Training complete" "$WORK_DIR/logs/training.log" 2>/dev/null; then
 fi
 
 EPOCH=$(python -c "
-import torch, sys
+import torch
 try:
     t = torch.load('$WORK_DIR/checkpoints/last.ckpt', map_location='cpu')
     print(t.get('epoch', 0))
