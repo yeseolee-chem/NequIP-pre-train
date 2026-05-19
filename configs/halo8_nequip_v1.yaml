@@ -20,17 +20,19 @@ default_dtype: float32
 
 # ===== Dataset =====
 dataset: ase
-dataset_file_name: /gpfs/home1/yeseo1ee/projects/halo8-nequip-pretrain/output/halo8_nequip_v1/data/halo8_train.extxyz
+dataset_file_name: 
+  /gpfs/home1/yeseo1ee/projects/halo8-nequip-pretrain/output/halo8_nequip_v1/data/halo8_train.extxyz
 validation_dataset: ase
-validation_dataset_file_name: /gpfs/home1/yeseo1ee/projects/halo8-nequip-pretrain/output/halo8_nequip_v1/data/halo8_val.extxyz
+validation_dataset_file_name: 
+  /gpfs/home1/yeseo1ee/projects/halo8-nequip-pretrain/output/halo8_nequip_v1/data/halo8_val.extxyz
 chemical_symbols: [H, C, N, O, F, Cl, Br]
 key_mapping:
   energy: total_energy
   forces: forces
 
 # Placeholders — overwritten by prepare_data.py
-n_train: 4916760
-n_val: 49224
+n_train: 3075582
+n_val: 49595
 
 # ===== Model architecture — Batzner 2022 Methods =====
 model_builders:
@@ -95,11 +97,18 @@ ema_decay: 0.99
 ema_use_num_updates: true
 
 # ===== Training =====
-batch_size: 5
-validation_batch_size: 16
+batch_size: 4
+validation_batch_size: 8
 max_epochs: 200
 shuffle: true
 metrics_key: validation_loss
+
+# Skip the pre-training validation pass — for 49,595 val frames it took
+# ~2h17min on RTX 3090 with bs=16 and crashed the worker chain at the
+# transition into epoch 1. With report_init_validation=False training
+# begins immediately; the first validation metrics arrive at the end of
+# epoch 1 (a few minutes in).
+report_init_validation: false
 
 early_stopping_lower_bounds:
   LR: 1.0e-6
