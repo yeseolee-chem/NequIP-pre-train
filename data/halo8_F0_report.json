@@ -1,0 +1,19 @@
+{
+  "method": "stage0_fragmentation.strict_v1 (BE-matrix decision tree)",
+  "completed_at": "2026-05-19T22:56:53",
+  "eligible_pool_size": 19163,
+  "frames_collected": 19163,
+  "n_passed": 11203,
+  "n_failed": 7960,
+  "failure_breakdown": {
+    "strain_only": 7960
+  },
+  "filters_applied": [
+    "n_components_R == 1",
+    "interior_ts",
+    "not short_traj",
+    "strict_v1: len(fragments)==2 and not strain_only"
+  ],
+  "elapsed_seconds": 2298.5430586338043,
+  "output_path": "/gpfs/home1/yeseo1ee/projects/halo8-nequip-pretrain/data/halo8_F0_passed.json"
+}

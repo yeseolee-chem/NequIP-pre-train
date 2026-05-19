@@ -48,6 +48,12 @@ HALO8_DB_DIR = Path(os.environ.get(
 ))
 HALO8_SHARDS = [HALO8_DB_DIR / f"Halo_{i}.db" for i in range(1, 11)]
 F0_PATH = PROJECT / "data" / "halo8_F0_passed.json"
+# Reactions under active ADF computation in eda-asm-prediction —
+# excluded from the NequIP backbone training set to prevent leakage.
+ADF_HOLDOUT_PATH = Path(os.environ.get(
+    "ADF_HOLDOUT_PATH",
+    "/gpfs/home1/yeseo1ee/projects/eda-asm-prediction/outputs/asr_spec_rxn_list.txt",
+))
 INDEX_PARQUET = Path(os.environ.get(
     "HALO8_INDEX_PARQUET",
     "/gpfs/home1/yeseo1ee/projects/eda-asm-prediction/data/halo8_index/index.parquet",
@@ -154,14 +160,36 @@ def extract_data(row, ef_mode: str):
 # Reaction selection — F0_passed list preferred; fallback to index.parquet
 # --------------------------------------------------------------------------
 def select_reactions(seed: int) -> tuple[set[str], dict]:
+    """Return (selected_rxn_ids, provenance).
+
+    Precedence:
+      1. ``data/halo8_F0_passed.json`` (canonical F0-passed list, produced by
+         ``scripts/build_f0_passed.py`` running stage0_fragmentation.strict_v1
+         on every eligible Halo8 reaction).
+      2. ``index.parquet`` fallback with simple connectivity filters.
+
+    In BOTH paths, reactions in ``ADF_HOLDOUT_PATH`` (the 500 reactions
+    currently being computed by ADF) are removed so they remain
+    unseen by the NequIP backbone.
+    """
+    adf_holdout: set[str] = set()
+    if ADF_HOLDOUT_PATH.exists():
+        adf_holdout = set(ADF_HOLDOUT_PATH.read_text().split())
+
     if F0_PATH.exists():
         with F0_PATH.open() as f:
             f0 = set(json.load(f))
-        if len(f0) != TARGET_N_RXNS:
-            raise RuntimeError(
-                f"F0-passed list size mismatch: expected {TARGET_N_RXNS}, got {len(f0)}"
-            )
-        return f0, {"source": "F0_PASSED_LIST", "path": str(F0_PATH), "n": len(f0)}
+        before = len(f0)
+        if adf_holdout:
+            f0 = f0 - adf_holdout
+        return f0, {
+            "source": "F0_PASSED_LIST",
+            "path": str(F0_PATH),
+            "n_f0_passed": before,
+            "n_adf_holdout": len(adf_holdout),
+            "n_adf_holdout_in_f0": before - len(f0),
+            "n_selected": len(f0),
+        }
 
     if not INDEX_PARQUET.exists():
         raise SystemExit(
@@ -176,21 +204,19 @@ def select_reactions(seed: int) -> tuple[set[str], dict]:
         df = df.merge(bc, on="reaction_id", how="left")
         df = df[df["n_components_R"] == 1]
     df = df[df["interior_ts"] & ~df["short_traj"]]
-
     rxn_list = sorted(df["reaction_id"].astype(str).tolist())
-    if len(rxn_list) < TARGET_N_RXNS:
-        raise RuntimeError(
-            f"Index parquet has only {len(rxn_list)} eligible reactions; need {TARGET_N_RXNS}"
-        )
-    random.Random(seed).shuffle(rxn_list)
-    selected = set(sorted(rxn_list[:TARGET_N_RXNS]))
-    return selected, {
+    n_eligible = len(rxn_list)
+    if adf_holdout:
+        rxn_list = [r for r in rxn_list if r not in adf_holdout]
+    return set(rxn_list), {
         "source": "INDEX_PARQUET_FALLBACK",
         "path": str(INDEX_PARQUET),
         "filters": "interior_ts & !short_traj & n_components_R==1",
-        "n_eligible": len(rxn_list),
-        "n_selected": len(selected),
-        "WARNING": "True F0-passed list not provided — deterministic 17574-reaction subset",
+        "n_eligible": n_eligible,
+        "n_adf_holdout": len(adf_holdout),
+        "n_selected": len(rxn_list),
+        "WARNING": "Using simple connectivity proxy (not full F0). "
+                   "Run scripts/build_f0_passed.py for the strict list.",
     }
 
 
