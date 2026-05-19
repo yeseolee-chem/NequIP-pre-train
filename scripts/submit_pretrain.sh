@@ -6,8 +6,11 @@
 # inter-rank coordination via torch.distributed.
 
 #SBATCH --job-name=halo8_nequip
-#SBATCH --partition=gpu1
-#SBATCH --gres=gpu:rtx3090:4
+# Try multiple GPU partitions — SLURM picks the one with earliest start.
+# gpu4/gpu5 (A6000 48GB) and gpu3 (A6000ada 48GB) are preferred over gpu1
+# (RTX 3090 24GB) for memory headroom; gpu6 (A10 24GB) is a fallback.
+#SBATCH --partition=gpu1,gpu3,gpu4,gpu5,gpu6
+#SBATCH --gres=gpu:4
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=128G
