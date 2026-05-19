@@ -97,8 +97,14 @@ ema_decay: 0.99
 ema_use_num_updates: true
 
 # ===== Training =====
-batch_size: 4
-validation_batch_size: 8
+# GPU was at 15% utilisation with bs=4 / num_workers=0 on RTX 3090 (24 GB),
+# only 1 GB of GPU memory used — pure dataloader bottleneck. Bumping
+# batch_size 8× and turning on 8 worker processes should saturate the GPU
+# while still fitting in ~10 GB of GPU memory (linear scaling from the
+# observed 1 GB at bs=4).
+batch_size: 32
+validation_batch_size: 64
+dataloader_num_workers: 8
 max_epochs: 200
 shuffle: true
 metrics_key: validation_loss
