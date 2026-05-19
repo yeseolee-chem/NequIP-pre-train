@@ -25,7 +25,7 @@ dataset_file_name:
 validation_dataset: ase
 validation_dataset_file_name: 
   /gpfs/home1/yeseo1ee/projects/halo8-nequip-pretrain/output/halo8_nequip_v1/data/halo8_val.extxyz
-chemical_symbols: [H, C, N, O, F, Cl, Br]
+chemical_symbols: [H, C, N, O, F, S, Cl, Br]
 key_mapping:
   energy: total_energy
   forces: forces
