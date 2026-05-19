@@ -1,11 +1,16 @@
 #!/bin/bash
-# Halo8 NequIP pretraining — auto-resubmitting SLURM driver (Spec v5 §6).
+# Halo8 NequIP 0.9.1 pre-training — multi-GPU DDP SLURM driver.
+#
+# Lightning auto-spawns one process per GPU via DDP; we request 4 GPUs on a
+# single gpu1 (RTX 3090) node and a single SLURM task. Lightning handles
+# inter-rank coordination via torch.distributed.
 
 #SBATCH --job-name=halo8_nequip
 #SBATCH --partition=gpu1
-#SBATCH --gres=gpu:rtx3090:1
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=64G
+#SBATCH --gres=gpu:rtx3090:4
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=32
+#SBATCH --mem=128G
 #SBATCH --time=48:00:00
 #SBATCH --output=output/halo8_nequip_v1/logs/slurm/job-%j.out
 #SBATCH --error=output/halo8_nequip_v1/logs/slurm/job-%j.err
@@ -15,13 +20,14 @@ set -euo pipefail
 
 PROJECT_DIR="/gpfs/home1/yeseo1ee/projects/halo8-nequip-pretrain"
 WORK_DIR="$PROJECT_DIR/output/halo8_nequip_v1"
-CONFIG="$PROJECT_DIR/configs/halo8_nequip_v1.yaml"
+CONFIG_DIR="$PROJECT_DIR/configs"
+CONFIG_NAME="halo8_nequip_v1.yaml"
 DONE_FLAG="$WORK_DIR/training_complete.flag"
 COUNT_FILE="$WORK_DIR/resubmit_count.txt"
 MAX_RESUBMIT=50
 RESUBMIT_DELAY_ON_CRASH=120
 
-mkdir -p "$WORK_DIR/logs/slurm" "$WORK_DIR/checkpoints"
+mkdir -p "$WORK_DIR/logs/slurm" "$WORK_DIR/training_run"
 cd "$PROJECT_DIR"
 
 [ -f "$COUNT_FILE" ] || echo "0" > "$COUNT_FILE"
@@ -41,9 +47,6 @@ source /home1/yeseo1ee/miniconda3/etc/profile.d/conda.sh
 conda activate reactot
 echo "[$(date)] python=$(which python)  nequip-train=$(which nequip-train)"
 
-# TF32 — propagated to the launcher
-export NEQUIP_ENABLE_TF32=1
-
 TRAIN_PID=""
 graceful_exit() {
     echo "[$(date)] === SIGUSR1 received — graceful shutdown ==="
@@ -54,17 +57,10 @@ graceful_exit() {
             sleep 5
             wc=$((wc + 1))
             if [ $wc -ge 96 ]; then
-                echo "[$(date)] WARNING: nequip did not exit within 8min, force kill"
                 kill -SIGKILL "$TRAIN_PID" 2>/dev/null || true
                 break
             fi
         done
-    fi
-    if [ -f "$WORK_DIR/training_run/checkpoints/last.ckpt" ]; then
-        AGE=$(($(date +%s) - $(stat -c %Y "$WORK_DIR/training_run/checkpoints/last.ckpt")))
-        echo "[$(date)] last.ckpt age=${AGE}s"
-    else
-        echo "[$(date)] WARNING: no last.ckpt to resume from"
     fi
     NEW_COUNT=$((COUNT + 1))
     echo "$NEW_COUNT" > "$COUNT_FILE"
@@ -86,78 +82,67 @@ python "$PROJECT_DIR/scripts/prepare_data.py" || {
     exit 3
 }
 
-# NequIP auto-detects $root/$run_name/trainer.pth and restarts itself,
-# so we do NOT pass --restart explicitly. But: if NequIP saved trainer.pth
-# during initialization (before the lr_scheduler state is populated) and
-# then crashed, the next attempt loops forever with `KeyError: 'lr_sched'`
-# during restart. Guard: if no epoch has actually completed
-# (metrics_epoch.csv is empty), wipe the partial training_run/ so the
-# next attempt is a true fresh start and emits the real error.
-NEQUIP_RUN="$WORK_DIR/training_run"
-EPOCH_CSV="$NEQUIP_RUN/metrics_epoch.csv"
-if [ -f "$NEQUIP_RUN/trainer.pth" ]; then
-    if [ -s "$EPOCH_CSV" ]; then
-        echo "[$(date)] trainer.pth present and metrics_epoch.csv non-empty — NequIP will resume"
-    else
-        echo "[$(date)] trainer.pth present but no epoch completed — wiping training_run for fresh start"
-        rm -rf "$NEQUIP_RUN"
-    fi
-fi
-RESTART_FLAG=""
-if [ ! -d "$NEQUIP_RUN" ]; then
+# Lightning's ModelCheckpoint(save_last=True) writes <dirpath>/last.ckpt.
+# NequIP resumes by passing the path via the hydra `ckpt_path` override.
+LAST_CKPT="$WORK_DIR/training_run/last.ckpt"
+HYDRA_CKPT_ARG=""
+if [ -f "$LAST_CKPT" ]; then
+    echo "[$(date)] resuming from $LAST_CKPT"
+    HYDRA_CKPT_ARG="++ckpt_path=$LAST_CKPT"
+else
     echo "[$(date)] starting fresh"
-    # record git SHA at fresh start for provenance
     git -C "$PROJECT_DIR" rev-parse HEAD > "$WORK_DIR/code_sha.txt" 2>/dev/null \
         || echo "unknown" > "$WORK_DIR/code_sha.txt"
 fi
 
-# Preserve per-job training log so the real first-attempt traceback
-# isn't overwritten by a follow-up restart attempt's failure.
+# Preserve previous attempt's stdout/stderr so a failing restart doesn't
+# overwrite the original first-attempt traceback.
 if [ -f "$WORK_DIR/logs/training.log" ]; then
     cp "$WORK_DIR/logs/training.log" "$WORK_DIR/logs/training.prev.log" 2>/dev/null || true
 fi
 
+# Hydra's @main has the default config_path set to os.getcwd(). We can either
+# cd into $CONFIG_DIR or pass --config-path explicitly. Use the explicit
+# form so cwd remains at $PROJECT_DIR (paths in the config are absolute
+# anyway, but this keeps SLURM working-dir semantics predictable).
+HYDRA_RUN_DIR="$WORK_DIR/training_run/hydra/${SLURM_JOB_ID:-local}"
+mkdir -p "$HYDRA_RUN_DIR"
+
 nvidia-smi || true
 
-echo "[$(date)] launching nequip_launcher.py..."
-# Stay in $PROJECT_DIR — the config now uses absolute paths, but keeping
-# cwd at the project root means any relative path NequIP creates lands
-# in a predictable place. NequIP writes into <config.root>/<run_name>/
-# (which is $WORK_DIR/training_run/) regardless of cwd.
+echo "[$(date)] launching nequip-train (4-GPU DDP)..."
 # shellcheck disable=SC2086
-python "$PROJECT_DIR/scripts/nequip_launcher.py" $RESTART_FLAG "$CONFIG" \
+nequip-train \
+    --config-path "$CONFIG_DIR" \
+    --config-name "$CONFIG_NAME" \
+    hydra.run.dir="$HYDRA_RUN_DIR" \
+    $HYDRA_CKPT_ARG \
     > "$WORK_DIR/logs/training.log" 2>&1 &
 TRAIN_PID=$!
-echo "[$(date)] nequip launcher pid=$TRAIN_PID"
+echo "[$(date)] nequip-train pid=$TRAIN_PID"
 
-# wait must not trip `set -e` when nequip exits non-zero — capture the
-# code via the `||` fallback. Previously the script died here and the
-# resubmit logic below never ran (chain silently broken).
 EXIT_CODE=0
 wait "$TRAIN_PID" || EXIT_CODE=$?
-echo "[$(date)] nequip exited with code $EXIT_CODE"
+echo "[$(date)] nequip-train exited with code $EXIT_CODE"
 
 if [ -f "$DONE_FLAG" ]; then
     echo "[$(date)] DONE_FLAG present — stopping chain"
     exit 0
 fi
-if grep -q "Training complete" "$WORK_DIR/logs/training.log" 2>/dev/null; then
-    echo "[$(date)] training-complete marker found — stopping chain"
+if grep -q "Trainer.fit stopped" "$WORK_DIR/logs/training.log" 2>/dev/null; then
+    echo "[$(date)] Lightning early-stop marker detected — marking complete"
     touch "$DONE_FLAG"
     exit 0
 fi
 
-EPOCH=$(python -c "
-import torch
-try:
-    t = torch.load('$WORK_DIR/training_run/checkpoints/last.ckpt', map_location='cpu')
-    print(t.get('epoch', 0))
-except Exception:
-    print(0)
-" 2>/dev/null || echo 0)
-MAX_EPOCHS=$(python -c "import yaml; print(yaml.safe_load(open('$CONFIG'))['max_epochs'])")
-echo "[$(date)] epoch=$EPOCH / $MAX_EPOCHS"
-if [ "$EPOCH" -ge "$MAX_EPOCHS" ]; then
+# Try to read the last completed epoch from the most recent metrics csv.
+EPOCH=$(find "$WORK_DIR/training_run/lightning_logs" -name "metrics.csv" -print 2>/dev/null \
+    | xargs -I {} bash -c 'tail -1 "$1" 2>/dev/null' _ {} \
+    | awk -F',' 'NR==1 {print $1}' 2>/dev/null)
+EPOCH=${EPOCH:-0}
+MAX_EPOCHS=$(python -c "import yaml; c=yaml.safe_load(open('$CONFIG_DIR/$CONFIG_NAME'));print(c['trainer']['max_epochs'])")
+echo "[$(date)] last_epoch=$EPOCH / $MAX_EPOCHS"
+if [ -n "$EPOCH" ] && [ "$EPOCH" -ge "$MAX_EPOCHS" ] 2>/dev/null; then
     echo "[$(date)] reached max_epochs — marking complete"
     touch "$DONE_FLAG"
     exit 0
