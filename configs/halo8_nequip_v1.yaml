@@ -184,6 +184,7 @@ training_module:
 # =====================
 #    GLOBAL OPTIONS
 # =====================
+# set_global_state(allow_tf32, warn_on_override) — that's the entire surface.
+# Seeds for data/model are set in their respective sections.
 global_options:
   allow_tf32: true
-  seed: 42
