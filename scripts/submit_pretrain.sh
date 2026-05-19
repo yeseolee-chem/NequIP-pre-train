@@ -86,16 +86,35 @@ python "$PROJECT_DIR/scripts/prepare_data.py" || {
     exit 3
 }
 
-CHECKPOINT="$WORK_DIR/training_run/checkpoints/last.ckpt"
+# NequIP auto-detects $root/$run_name/trainer.pth and restarts itself,
+# so we do NOT pass --restart explicitly. But: if NequIP saved trainer.pth
+# during initialization (before the lr_scheduler state is populated) and
+# then crashed, the next attempt loops forever with `KeyError: 'lr_sched'`
+# during restart. Guard: if no epoch has actually completed
+# (metrics_epoch.csv is empty), wipe the partial training_run/ so the
+# next attempt is a true fresh start and emits the real error.
+NEQUIP_RUN="$WORK_DIR/training_run"
+EPOCH_CSV="$NEQUIP_RUN/metrics_epoch.csv"
+if [ -f "$NEQUIP_RUN/trainer.pth" ]; then
+    if [ -s "$EPOCH_CSV" ]; then
+        echo "[$(date)] trainer.pth present and metrics_epoch.csv non-empty — NequIP will resume"
+    else
+        echo "[$(date)] trainer.pth present but no epoch completed — wiping training_run for fresh start"
+        rm -rf "$NEQUIP_RUN"
+    fi
+fi
 RESTART_FLAG=""
-if [ -f "$CHECKPOINT" ]; then
-    echo "[$(date)] resuming from $CHECKPOINT"
-    RESTART_FLAG="--restart $CHECKPOINT"
-else
+if [ ! -d "$NEQUIP_RUN" ]; then
     echo "[$(date)] starting fresh"
     # record git SHA at fresh start for provenance
     git -C "$PROJECT_DIR" rev-parse HEAD > "$WORK_DIR/code_sha.txt" 2>/dev/null \
         || echo "unknown" > "$WORK_DIR/code_sha.txt"
+fi
+
+# Preserve per-job training log so the real first-attempt traceback
+# isn't overwritten by a follow-up restart attempt's failure.
+if [ -f "$WORK_DIR/logs/training.log" ]; then
+    cp "$WORK_DIR/logs/training.log" "$WORK_DIR/logs/training.prev.log" 2>/dev/null || true
 fi
 
 nvidia-smi || true
