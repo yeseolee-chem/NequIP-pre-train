@@ -3,25 +3,34 @@
 # (comments here are preserved on re-write).
 
 # ===== Run metadata =====
-root: output/
-run_name: halo8_nequip_v1
+# IMPORTANT: NequIP does `rmtree(f"{root}/{run_name}")` when there's no
+# trainer.pth in that folder — i.e. on every fresh start before the first
+# epoch checkpoint lands. So `root/run_name` must NOT overlap with our
+# orchestration WORK_DIR (which holds the irreplaceable extxyz files in
+# data/, slurm logs, sentinels, etc.). We isolate NequIP under a
+# dedicated subfolder `training_run/`.
+#
+# Paths below are absolute so cwd changes in submit_pretrain.sh don't
+# silently break dataset resolution.
+root: /gpfs/home1/yeseo1ee/projects/halo8-nequip-pretrain/output/halo8_nequip_v1
+run_name: training_run
 seed: 42
 dataset_seed: 42
 default_dtype: float32
 
 # ===== Dataset =====
 dataset: ase
-dataset_file_name: output/halo8_nequip_v1/data/halo8_train.extxyz
+dataset_file_name: /gpfs/home1/yeseo1ee/projects/halo8-nequip-pretrain/output/halo8_nequip_v1/data/halo8_train.extxyz
 validation_dataset: ase
-validation_dataset_file_name: output/halo8_nequip_v1/data/halo8_val.extxyz
+validation_dataset_file_name: /gpfs/home1/yeseo1ee/projects/halo8-nequip-pretrain/output/halo8_nequip_v1/data/halo8_val.extxyz
 chemical_symbols: [H, C, N, O, F, Cl, Br]
 key_mapping:
   energy: total_energy
   forces: forces
 
 # Placeholders — overwritten by prepare_data.py
-n_train: 1
-n_val: 1
+n_train: 4916760
+n_val: 49224
 
 # ===== Model architecture — Batzner 2022 Methods =====
 model_builders:
@@ -56,16 +65,16 @@ loss_coeffs:
 
 # ===== Metrics =====
 metrics_components:
-  - - forces
-    - mae
-  - - forces
-    - rmse
-  - - total_energy
-    - mae
-    - PerAtom: True
-  - - total_energy
-    - rmse
-    - PerAtom: True
+  -   - forces
+      - mae
+  -   - forces
+      - rmse
+  -   - total_energy
+      - mae
+      - PerAtom: true
+  -   - total_energy
+      - rmse
+      - PerAtom: true
 
 # ===== Optimizer — Batzner 2022 =====
 optimizer_name: Adam

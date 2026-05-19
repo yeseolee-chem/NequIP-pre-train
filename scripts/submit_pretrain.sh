@@ -60,8 +60,8 @@ graceful_exit() {
             fi
         done
     fi
-    if [ -f "$WORK_DIR/checkpoints/last.ckpt" ]; then
-        AGE=$(($(date +%s) - $(stat -c %Y "$WORK_DIR/checkpoints/last.ckpt")))
+    if [ -f "$WORK_DIR/training_run/checkpoints/last.ckpt" ]; then
+        AGE=$(($(date +%s) - $(stat -c %Y "$WORK_DIR/training_run/checkpoints/last.ckpt")))
         echo "[$(date)] last.ckpt age=${AGE}s"
     else
         echo "[$(date)] WARNING: no last.ckpt to resume from"
@@ -86,7 +86,7 @@ python "$PROJECT_DIR/scripts/prepare_data.py" || {
     exit 3
 }
 
-CHECKPOINT="$WORK_DIR/checkpoints/last.ckpt"
+CHECKPOINT="$WORK_DIR/training_run/checkpoints/last.ckpt"
 RESTART_FLAG=""
 if [ -f "$CHECKPOINT" ]; then
     echo "[$(date)] resuming from $CHECKPOINT"
@@ -101,15 +101,21 @@ fi
 nvidia-smi || true
 
 echo "[$(date)] launching nequip_launcher.py..."
-cd "$WORK_DIR"
+# Stay in $PROJECT_DIR — the config now uses absolute paths, but keeping
+# cwd at the project root means any relative path NequIP creates lands
+# in a predictable place. NequIP writes into <config.root>/<run_name>/
+# (which is $WORK_DIR/training_run/) regardless of cwd.
 # shellcheck disable=SC2086
 python "$PROJECT_DIR/scripts/nequip_launcher.py" $RESTART_FLAG "$CONFIG" \
     > "$WORK_DIR/logs/training.log" 2>&1 &
 TRAIN_PID=$!
 echo "[$(date)] nequip launcher pid=$TRAIN_PID"
 
-wait $TRAIN_PID
-EXIT_CODE=$?
+# wait must not trip `set -e` when nequip exits non-zero — capture the
+# code via the `||` fallback. Previously the script died here and the
+# resubmit logic below never ran (chain silently broken).
+EXIT_CODE=0
+wait "$TRAIN_PID" || EXIT_CODE=$?
 echo "[$(date)] nequip exited with code $EXIT_CODE"
 
 if [ -f "$DONE_FLAG" ]; then
@@ -125,7 +131,7 @@ fi
 EPOCH=$(python -c "
 import torch
 try:
-    t = torch.load('$WORK_DIR/checkpoints/last.ckpt', map_location='cpu')
+    t = torch.load('$WORK_DIR/training_run/checkpoints/last.ckpt', map_location='cpu')
     print(t.get('epoch', 0))
 except Exception:
     print(0)
