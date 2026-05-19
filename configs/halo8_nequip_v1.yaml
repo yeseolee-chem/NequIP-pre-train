@@ -128,3 +128,8 @@ wandb: false
 wandb_project: halo8_nequip_pretrain
 wandb_resume: allow
 append: true
+
+# NequIP's _unused_check otherwise hard-fails when wandb is disabled
+# (n_save_keep, wandb_project, wandb_resume become "unused"). Downgrade
+# to a warning so the run can actually start.
+warn_unused: true
