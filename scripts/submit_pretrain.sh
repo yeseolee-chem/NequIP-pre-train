@@ -10,9 +10,13 @@
 # gpu4/gpu5 (A6000 48GB) and gpu3 (A6000ada 48GB) are preferred over gpu1
 # (RTX 3090 24GB) for memory headroom; gpu6 (A10 24GB) is a fallback.
 #SBATCH --partition=gpu1,gpu3,gpu4,gpu5,gpu6
+#SBATCH --nodes=1
 #SBATCH --gres=gpu:4
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=32
+# 1 SLURM task per GPU — Lightning auto-detects SLURM_NTASKS as the
+# DDP world size. Earlier `--ntasks=1` reduced the DDP world size to 1
+# (job 649813 ran on a single GPU despite 4 being allocated).
+#SBATCH --ntasks-per-node=4
+#SBATCH --cpus-per-task=8
 #SBATCH --mem=128G
 #SBATCH --time=48:00:00
 #SBATCH --output=output/halo8_nequip_v1/logs/slurm/job-%j.out
@@ -113,13 +117,17 @@ mkdir -p "$HYDRA_RUN_DIR"
 
 nvidia-smi || true
 
-echo "[$(date)] launching nequip-train (4-GPU DDP)..."
+echo "[$(date)] launching nequip-train via srun (4-GPU DDP, ntasks-per-node=$SLURM_NTASKS_PER_NODE)..."
+# srun spawns SLURM_NTASKS_PER_NODE processes; Lightning detects this and
+# uses them as DDP ranks. Without srun, Lightning + ntasks=1 collapses to
+# rank 0 only — see comments in the SBATCH header.
 # shellcheck disable=SC2086
-nequip-train \
-    --config-path "$CONFIG_DIR" \
-    --config-name "$CONFIG_NAME" \
-    hydra.run.dir="$HYDRA_RUN_DIR" \
-    $HYDRA_CKPT_ARG \
+srun --ntasks-per-node=$SLURM_NTASKS_PER_NODE --cpus-per-task=$SLURM_CPUS_PER_TASK \
+    nequip-train \
+        --config-path "$CONFIG_DIR" \
+        --config-name "$CONFIG_NAME" \
+        hydra.run.dir="$HYDRA_RUN_DIR" \
+        $HYDRA_CKPT_ARG \
     > "$WORK_DIR/logs/training.log" 2>&1 &
 TRAIN_PID=$!
 echo "[$(date)] nequip-train pid=$TRAIN_PID"
