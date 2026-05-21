@@ -54,6 +54,18 @@ source /home1/yeseo1ee/miniconda3/etc/profile.d/conda.sh
 conda activate reactot
 echo "[$(date)] python=$(which python)  nequip-train=$(which nequip-train)"
 
+# Both 649909 and 650533 froze silently mid-training (NCCL allreduce deadlock,
+# no Python-level error, no exit). Without a timeout NCCL waits forever and
+# our auto-resubmit chain never fires. Force NCCL to error out when a
+# collective stalls so SLURM sees a non-zero exit and resubmits.
+export TORCH_NCCL_BLOCKING_WAIT=1
+export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
+export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=600   # 10 min before collective is killed
+export NCCL_TIMEOUT=600
+# Verbose NCCL logging so we can identify which collective hung.
+export NCCL_DEBUG=WARN
+echo "[$(date)] NCCL timeout/heartbeat env exported"
+
 TRAIN_PID=""
 graceful_exit() {
     echo "[$(date)] === SIGUSR1 received — graceful shutdown ==="
