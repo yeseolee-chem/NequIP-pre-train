@@ -83,7 +83,15 @@ trainer:
   _target_: lightning.Trainer
   accelerator: gpu
   devices: 4                  # 4× RTX 3090 single node
-  strategy: ddp
+  # NequIP-provided DDP that does manual gradient all_reduce instead of
+  # wrapping the model in torch.nn.parallel.DistributedDataParallel. The
+  # default `strategy: ddp` has caused four silent NCCL allreduce hangs
+  # at unpredictable epoch boundaries (649909, 650533, and twice in 650969).
+  # NCCL timeouts (TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=600 etc.) did NOT fire.
+  # SimpleDDPStrategy is documented as the more robust path for this kind
+  # of multi-rank training where the default wrapper has trouble.
+  strategy:
+    _target_: nequip.train.SimpleDDPStrategy
   precision: 32-true
   enable_checkpointing: true
   max_epochs: 200
