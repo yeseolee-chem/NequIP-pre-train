@@ -1,22 +1,11 @@
 #!/bin/bash
-# Halo8 NequIP 0.9.1 pre-training — multi-GPU DDP SLURM driver.
-#
-# Lightning auto-spawns one process per GPU via DDP; we request 4 GPUs on a
-# single gpu1 (RTX 3090) node and a single SLURM task. Lightning handles
-# inter-rank coordination via torch.distributed.
+# Halo8 NequIP pretraining — auto-resubmitting SLURM driver (Spec v5 §6).
 
 #SBATCH --job-name=halo8_nequip
-# Try multiple GPU partitions — SLURM picks the one with earliest start.
-# gpu4/gpu5 (A6000 48GB) and gpu3 (A6000ada 48GB) are preferred over gpu1
-# (RTX 3090 24GB) for memory headroom; gpu6 (A10 24GB) is a fallback.
-#SBATCH --partition=gpu1,gpu3,gpu4,gpu5,gpu6
-#SBATCH --nodes=1
-#SBATCH --gres=gpu:1
-# DDP+ckpt resume reproducibly hangs at startup (4 GPU, 2 GPU, NCCL+IB,
-# GLOO+TCP, multiple nodes). Fall back to single GPU: no DDP at all.
-#SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=16
-#SBATCH --mem=128G
+#SBATCH --partition=gpu1
+#SBATCH --gres=gpu:rtx3090:1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=64G
 #SBATCH --time=48:00:00
 #SBATCH --output=output/halo8_nequip_v1/logs/slurm/job-%j.out
 #SBATCH --error=output/halo8_nequip_v1/logs/slurm/job-%j.err
@@ -26,14 +15,13 @@ set -euo pipefail
 
 PROJECT_DIR="/gpfs/home1/yeseo1ee/projects/halo8-nequip-pretrain"
 WORK_DIR="$PROJECT_DIR/output/halo8_nequip_v1"
-CONFIG_DIR="$PROJECT_DIR/configs"
-CONFIG_NAME="halo8_nequip_v1.yaml"
+CONFIG="$PROJECT_DIR/configs/halo8_nequip_v1.yaml"
 DONE_FLAG="$WORK_DIR/training_complete.flag"
 COUNT_FILE="$WORK_DIR/resubmit_count.txt"
 MAX_RESUBMIT=50
 RESUBMIT_DELAY_ON_CRASH=120
 
-mkdir -p "$WORK_DIR/logs/slurm" "$WORK_DIR/training_run"
+mkdir -p "$WORK_DIR/logs/slurm" "$WORK_DIR/checkpoints"
 cd "$PROJECT_DIR"
 
 [ -f "$COUNT_FILE" ] || echo "0" > "$COUNT_FILE"
@@ -53,17 +41,8 @@ source /home1/yeseo1ee/miniconda3/etc/profile.d/conda.sh
 conda activate reactot
 echo "[$(date)] python=$(which python)  nequip-train=$(which nequip-train)"
 
-# Both 649909 and 650533 froze silently mid-training (NCCL allreduce deadlock,
-# no Python-level error, no exit). Without a timeout NCCL waits forever and
-# our auto-resubmit chain never fires. Force NCCL to error out when a
-# collective stalls so SLURM sees a non-zero exit and resubmits.
-export TORCH_NCCL_BLOCKING_WAIT=1
-export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
-export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=600   # 10 min before collective is killed
-export NCCL_TIMEOUT=600
-# Verbose NCCL logging so we can identify which collective hung.
-export NCCL_DEBUG=WARN
-echo "[$(date)] NCCL timeout/heartbeat env exported"
+# TF32 — propagated to the launcher
+export NEQUIP_ENABLE_TF32=1
 
 TRAIN_PID=""
 graceful_exit() {
@@ -75,10 +54,17 @@ graceful_exit() {
             sleep 5
             wc=$((wc + 1))
             if [ $wc -ge 96 ]; then
+                echo "[$(date)] WARNING: nequip did not exit within 8min, force kill"
                 kill -SIGKILL "$TRAIN_PID" 2>/dev/null || true
                 break
             fi
         done
+    fi
+    if [ -f "$WORK_DIR/training_run/checkpoints/last.ckpt" ]; then
+        AGE=$(($(date +%s) - $(stat -c %Y "$WORK_DIR/training_run/checkpoints/last.ckpt")))
+        echo "[$(date)] last.ckpt age=${AGE}s"
+    else
+        echo "[$(date)] WARNING: no last.ckpt to resume from"
     fi
     NEW_COUNT=$((COUNT + 1))
     echo "$NEW_COUNT" > "$COUNT_FILE"
@@ -100,102 +86,78 @@ python "$PROJECT_DIR/scripts/prepare_data.py" || {
     exit 3
 }
 
-# Lightning's ModelCheckpoint(save_last=True) writes <dirpath>/last.ckpt.
-# NequIP resumes by passing the path via the hydra `ckpt_path` override.
-LAST_CKPT="$WORK_DIR/training_run/last.ckpt"
-HYDRA_CKPT_ARG=""
-if [ -f "$LAST_CKPT" ]; then
-    echo "[$(date)] resuming from $LAST_CKPT"
-    HYDRA_CKPT_ARG="++ckpt_path=$LAST_CKPT"
-else
+# NequIP auto-detects $root/$run_name/trainer.pth and restarts itself,
+# so we do NOT pass --restart explicitly. But: if NequIP saved trainer.pth
+# during initialization (before the lr_scheduler state is populated) and
+# then crashed, the next attempt loops forever with `KeyError: 'lr_sched'`
+# during restart. Guard: if no epoch has actually completed
+# (metrics_epoch.csv is empty), wipe the partial training_run/ so the
+# next attempt is a true fresh start and emits the real error.
+NEQUIP_RUN="$WORK_DIR/training_run"
+EPOCH_CSV="$NEQUIP_RUN/metrics_epoch.csv"
+if [ -f "$NEQUIP_RUN/trainer.pth" ]; then
+    if [ -s "$EPOCH_CSV" ]; then
+        echo "[$(date)] trainer.pth present and metrics_epoch.csv non-empty — NequIP will resume"
+    else
+        echo "[$(date)] trainer.pth present but no epoch completed — wiping training_run for fresh start"
+        rm -rf "$NEQUIP_RUN"
+    fi
+fi
+RESTART_FLAG=""
+if [ ! -d "$NEQUIP_RUN" ]; then
     echo "[$(date)] starting fresh"
+    # record git SHA at fresh start for provenance
     git -C "$PROJECT_DIR" rev-parse HEAD > "$WORK_DIR/code_sha.txt" 2>/dev/null \
         || echo "unknown" > "$WORK_DIR/code_sha.txt"
 fi
 
-# Preserve previous attempt's stdout/stderr so a failing restart doesn't
-# overwrite the original first-attempt traceback.
+# Preserve per-job training log so the real first-attempt traceback
+# isn't overwritten by a follow-up restart attempt's failure.
 if [ -f "$WORK_DIR/logs/training.log" ]; then
     cp "$WORK_DIR/logs/training.log" "$WORK_DIR/logs/training.prev.log" 2>/dev/null || true
 fi
 
-# Hydra's @main has the default config_path set to os.getcwd(). We can either
-# cd into $CONFIG_DIR or pass --config-path explicitly. Use the explicit
-# form so cwd remains at $PROJECT_DIR (paths in the config are absolute
-# anyway, but this keeps SLURM working-dir semantics predictable).
-HYDRA_RUN_DIR="$WORK_DIR/training_run/hydra/${SLURM_JOB_ID:-local}"
-mkdir -p "$HYDRA_RUN_DIR"
-
 nvidia-smi || true
 
-echo "[$(date)] launching nequip-train via srun (4-GPU DDP, ntasks-per-node=$SLURM_NTASKS_PER_NODE)..."
-# srun spawns SLURM_NTASKS_PER_NODE processes; Lightning detects this and
-# uses them as DDP ranks. Without srun, Lightning + ntasks=1 collapses to
-# rank 0 only — see comments in the SBATCH header.
+echo "[$(date)] launching nequip_launcher.py..."
+# Stay in $PROJECT_DIR — the config now uses absolute paths, but keeping
+# cwd at the project root means any relative path NequIP creates lands
+# in a predictable place. NequIP writes into <config.root>/<run_name>/
+# (which is $WORK_DIR/training_run/) regardless of cwd.
 # shellcheck disable=SC2086
-srun --ntasks-per-node=$SLURM_NTASKS_PER_NODE --cpus-per-task=$SLURM_CPUS_PER_TASK \
-    nequip-train \
-        --config-path "$CONFIG_DIR" \
-        --config-name "$CONFIG_NAME" \
-        hydra.run.dir="$HYDRA_RUN_DIR" \
-        $HYDRA_CKPT_ARG \
+python "$PROJECT_DIR/scripts/nequip_launcher.py" $RESTART_FLAG "$CONFIG" \
     > "$WORK_DIR/logs/training.log" 2>&1 &
 TRAIN_PID=$!
-echo "[$(date)] nequip-train pid=$TRAIN_PID"
+echo "[$(date)] nequip launcher pid=$TRAIN_PID"
 
-# In-job hang watchdog: silent NCCL deadlocks have repeatedly hung the
-# chain for hours (NCCL_TIMEOUT/TORCH_NCCL_* did not fire, neither did
-# SimpleDDPStrategy's manual all_reduce). Detect by training.log mtime
-# staleness and force-kill srun + ranks; the main `wait` then returns
-# non-zero and the auto-resubmit block at the end of this script fires.
-STALE_THRESHOLD=3600  # 60 min without log update => hang (was 900s but
-                      # NequIP 0.9.x's stats computation on 3M frames
-                      # silently runs for ~30-45min; legitimate runs were
-                      # being killed mid-stats. Real hangs (resume + fit
-                      # frozen) take hours so 60min still catches them.
-(
-    sleep 1200  # grace period for setup / dataset stats (was 600s)
-    while kill -0 "$TRAIN_PID" 2>/dev/null; do
-        sleep 60
-        if [ ! -f "$WORK_DIR/logs/training.log" ]; then continue; fi
-        AGE=$(( $(date +%s) - $(stat -c %Y "$WORK_DIR/logs/training.log" 2>/dev/null || date +%s) ))
-        if [ "$AGE" -gt "$STALE_THRESHOLD" ]; then
-            echo "[$(date)] HANG WATCHDOG: training.log stale for ${AGE}s — force-killing srun (PID $TRAIN_PID)"
-            kill -SIGTERM "$TRAIN_PID" 2>/dev/null || true
-            sleep 30
-            kill -SIGKILL "$TRAIN_PID" 2>/dev/null || true
-            pkill -9 -u "$USER" -f "nequip-train" 2>/dev/null || true
-            break
-        fi
-    done
-) &
-WATCHDOG_PID=$!
-
+# wait must not trip `set -e` when nequip exits non-zero — capture the
+# code via the `||` fallback. Previously the script died here and the
+# resubmit logic below never ran (chain silently broken).
 EXIT_CODE=0
 wait "$TRAIN_PID" || EXIT_CODE=$?
-echo "[$(date)] nequip-train exited with code $EXIT_CODE"
-
-# Stop watchdog regardless of exit path
-kill "$WATCHDOG_PID" 2>/dev/null || true
+echo "[$(date)] nequip exited with code $EXIT_CODE"
 
 if [ -f "$DONE_FLAG" ]; then
     echo "[$(date)] DONE_FLAG present — stopping chain"
     exit 0
 fi
-if grep -q "Trainer.fit stopped" "$WORK_DIR/logs/training.log" 2>/dev/null; then
-    echo "[$(date)] Lightning early-stop marker detected — marking complete"
+if grep -q "Training complete" "$WORK_DIR/logs/training.log" 2>/dev/null; then
+    echo "[$(date)] training-complete marker found — stopping chain"
     touch "$DONE_FLAG"
     exit 0
 fi
 
-# Try to read the last completed epoch from the most recent metrics csv.
-EPOCH=$(find "$WORK_DIR/training_run/lightning_logs" -name "metrics.csv" -print 2>/dev/null \
-    | xargs -I {} bash -c 'tail -1 "$1" 2>/dev/null' _ {} \
-    | awk -F',' 'NR==1 {print $1}' 2>/dev/null)
-EPOCH=${EPOCH:-0}
-MAX_EPOCHS=$(python -c "import yaml; c=yaml.safe_load(open('$CONFIG_DIR/$CONFIG_NAME'));print(c['trainer']['max_epochs'])")
-echo "[$(date)] last_epoch=$EPOCH / $MAX_EPOCHS"
-if [ -n "$EPOCH" ] && [ "$EPOCH" -ge "$MAX_EPOCHS" ] 2>/dev/null; then
+EPOCH=$(python -c "
+import torch
+try:
+    t = torch.load('$WORK_DIR/training_run/checkpoints/last.ckpt', map_location='cpu')
+    print(t.get('epoch', 0))
+except Exception:
+    print(0)
+" 2>/dev/null || echo 0)
+MAX_EPOCHS=$(python -c "import yaml; print(yaml.safe_load(open('$CONFIG'))['max_epochs'])")
+echo "[$(date)] epoch=$EPOCH / $MAX_EPOCHS"
+if [ "$EPOCH" -ge "$MAX_EPOCHS" ]; then
     echo "[$(date)] reached max_epochs — marking complete"
     touch "$DONE_FLAG"
     exit 0

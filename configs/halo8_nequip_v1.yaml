@@ -1,191 +1,141 @@
-# Halo8 NequIP 0.9.1 pre-training (PyTorch Lightning + DDP)
+# Halo8 NequIP pretraining config — Spec v5 §4
+# n_train / n_val are injected by scripts/prepare_data.py via ruamel.yaml
+# (comments here are preserved on re-write).
+
+# ===== Run metadata =====
+# IMPORTANT: NequIP does `rmtree(f"{root}/{run_name}")` when there's no
+# trainer.pth in that folder — i.e. on every fresh start before the first
+# epoch checkpoint lands. So `root/run_name` must NOT overlap with our
+# orchestration WORK_DIR (which holds the irreplaceable extxyz files in
+# data/, slurm logs, sentinels, etc.). We isolate NequIP under a
+# dedicated subfolder `training_run/`.
 #
-# Migration from 0.6.2 to 0.9.1 was driven by the DDP requirement —
-# the older config schema doesn't exist; this is a full rewrite to
-# Hydra/Lightning style. Architecture and data choices preserve the
-# v5 spec intent (Batzner 2022 hyperparameters, EMA, ReduceLROnPlateau,
-# 8-species type set, force + per-atom-energy loss).
+# Paths below are absolute so cwd changes in submit_pretrain.sh don't
+# silently break dataset resolution.
+root: /gpfs/home1/yeseo1ee/projects/halo8-nequip-pretrain/output/halo8_nequip_v1
+run_name: training_run
+seed: 42
+dataset_seed: 42
+default_dtype: float32
 
-# ===========
-#     RUN
-# ===========
-run: [train]
+# ===== Dataset =====
+dataset: ase
+dataset_file_name: 
+  /gpfs/home1/yeseo1ee/projects/halo8-nequip-pretrain/output/halo8_nequip_v1/data/halo8_train.extxyz
+validation_dataset: ase
+validation_dataset_file_name: 
+  /gpfs/home1/yeseo1ee/projects/halo8-nequip-pretrain/output/halo8_nequip_v1/data/halo8_val.extxyz
+chemical_symbols: [H, C, N, O, F, S, Cl, Br]
+key_mapping:
+  energy: total_energy
+  forces: forces
 
+# Placeholders — overwritten by prepare_data.py
+n_train: 3075582
+n_val: 49595
 
-# ===========================
-#  Top-level interpolated vars
-# ===========================
-cutoff_radius: 5.0
+# ===== Model architecture — Batzner 2022 Methods =====
+model_builders:
+  - SimpleIrrepsConfig
+  - EnergyModel
+  - PerSpeciesRescale
+  - ForceOutput
+  - RescaleEnergyEtc
+
 num_layers: 4
 l_max: 2
+parity: true
 num_features: 64
+nonlinearity_type: gate
+resnet: true
 
-# 8 species — H, C, N, O, F, S, Cl, Br — discovered in the extxyz scan.
-model_type_names: [H, C, N, O, F, S, Cl, Br]
-chemical_species: ${model_type_names}
+r_max: 5.0                         # Deferred decision — revisit after Round 0
+num_basis: 8
+BesselBasis_trainable: true
+PolynomialCutoff_p: 6
+avg_num_neighbors: auto
 
-# Metric used by ModelCheckpoint / EarlyStopping / LR scheduler.
-monitored_metric: val0_epoch/weighted_sum
+invariant_layers: 3                # Batzner 2022: "three hidden layers"
+invariant_neurons: 64
 
+# ===== Loss =====
+loss_coeffs:
+  forces: 1.0
+  total_energy:
+    - 1.0
+    - PerAtomMSELoss
 
-# ============
-#     DATA
-# ============
-data:
-  _target_: nequip.data.datamodule.ASEDataModule
-  seed: 42
+# ===== Metrics =====
+metrics_components:
+  -   - forces
+      - mae
+  -   - forces
+      - rmse
+  -   - total_energy
+      - mae
+      - PerAtom: true
+  -   - total_energy
+      - rmse
+      - PerAtom: true
 
-  # The extxyz files were produced by scripts/prepare_data.py using strict_v1
-  # F0-passed reactions, with the 500-reaction ADF holdout removed and a
-  # 300-frame linspace endpoint-preserving subsample per reaction.
-  train_file_path:
-    /gpfs/home1/yeseo1ee/projects/halo8-nequip-pretrain/output/halo8_nequip_v1/data/halo8_train.extxyz
-  val_file_path:
-    /gpfs/home1/yeseo1ee/projects/halo8-nequip-pretrain/output/halo8_nequip_v1/data/halo8_val.extxyz
+# ===== Optimizer — Batzner 2022 =====
+optimizer_name: Adam
+learning_rate: 5.0e-3
+optimizer_amsgrad: true
+optimizer_betas: [0.9, 0.999]
+optimizer_eps: 1.0e-8
+optimizer_weight_decay: 0.0
 
-  key_mapping:
-    energy: total_energy
-    forces: forces
+lr_scheduler_name: ReduceLROnPlateau
+lr_scheduler_patience: 50
+lr_scheduler_factor: 0.5
+lr_scheduler_threshold: 1.0e-3
+lr_scheduler_min_lr: 1.0e-6
 
-  transforms:
-    - _target_: nequip.data.transforms.ChemicalSpeciesToAtomTypeMapper
-      chemical_symbols: ${chemical_species}
-    - _target_: nequip.data.transforms.NeighborListTransform
-      r_max: ${cutoff_radius}
+use_ema: true
+ema_decay: 0.99
+ema_use_num_updates: true
 
-  # Per-GPU batch sizes (Lightning will run independent dataloaders per rank).
-  # Effective global batch_size = 32 * num_gpus. Empirical RTX 3090 sweet
-  # spot from the 0.6.2 run (bs=32, num_workers=8 → 80%+ GPU util).
-  train_dataloader:
-    _target_: torch.utils.data.DataLoader
-    batch_size: 32
-    num_workers: 0   # eliminate dataloader subprocess fork — suspected source of hangs
-    shuffle: true
-    persistent_workers: false   # num_workers=0 requires this off
-  val_dataloader:
-    _target_: torch.utils.data.DataLoader
-    batch_size: 64
-    num_workers: ${data.train_dataloader.num_workers}
-    persistent_workers: false   # num_workers=0 requires this off
-  test_dataloader: ${data.val_dataloader}
+# ===== Training =====
+# GPU was at 15% utilisation with bs=4 / num_workers=0 on RTX 3090 (24 GB),
+# only 1 GB of GPU memory used — pure dataloader bottleneck. Bumping
+# batch_size 8× and turning on 8 worker processes should saturate the GPU
+# while still fitting in ~10 GB of GPU memory (linear scaling from the
+# observed 1 GB at bs=4).
+batch_size: 32
+validation_batch_size: 64
+dataloader_num_workers: 8
+max_epochs: 200
+shuffle: true
+metrics_key: validation_loss
 
-  stats_manager:
-    _target_: nequip.data.CommonDataStatisticsManager
-    dataloader_kwargs:
-      batch_size: 64
-    type_names: ${model_type_names}
+# Skip the pre-training validation pass — for 49,595 val frames it took
+# ~2h17min on RTX 3090 with bs=16 and crashed the worker chain at the
+# transition into epoch 1. With report_init_validation=False training
+# begins immediately; the first validation metrics arrive at the end of
+# epoch 1 (a few minutes in).
+report_init_validation: false
 
+early_stopping_lower_bounds:
+  LR: 1.0e-6
+early_stopping_patiences:
+  validation_loss: 100
 
-# =============
-#    TRAINER
-# =============
-trainer:
-  _target_: lightning.Trainer
-  accelerator: gpu
-  devices: 1                  # single GPU — DDP+resume hangs reproducible
-                              # across 4/2 GPUs, NCCL/GLOO, multiple nodes
-  strategy: auto
-  precision: 32-true
-  enable_checkpointing: true
-  max_epochs: 200
-  log_every_n_steps: 100
-  num_sanity_val_steps: 0     # skip the (slow) pre-training sanity validation
+# ===== Checkpointing — critical: do not reduce frequency =====
+save_checkpoint_freq: 1
+save_ema_checkpoint_freq: 1
+n_save_keep: 3
+log_epoch_freq: 1
+log_batch_freq: 1000
 
-  logger:
-    _target_: lightning.pytorch.loggers.CSVLogger
-    save_dir:
-      /gpfs/home1/yeseo1ee/projects/halo8-nequip-pretrain/output/halo8_nequip_v1/training_run
-    name: lightning_logs
+# ===== Logging =====
+verbose: info
+wandb: false
+wandb_project: halo8_nequip_pretrain
+wandb_resume: allow
+append: true
 
-  callbacks:
-    - _target_: lightning.pytorch.callbacks.ModelCheckpoint
-      monitor: ${monitored_metric}
-      dirpath:
-        /gpfs/home1/yeseo1ee/projects/halo8-nequip-pretrain/output/halo8_nequip_v1/training_run
-      filename: best
-      save_last: true
-      save_top_k: 1
-
-    - _target_: lightning.pytorch.callbacks.EarlyStopping
-      monitor: ${monitored_metric}
-      min_delta: 1.0e-3
-      patience: 100
-      mode: min
-
-    - _target_: lightning.pytorch.callbacks.LearningRateMonitor
-      logging_interval: epoch
-
-
-# =====================
-#    TRAINING MODULE
-# =====================
-training_module:
-  _target_: nequip.train.EMALightningModule
-  ema_decay: 0.99
-
-  loss:
-    _target_: nequip.train.EnergyForceLoss
-    per_atom_energy: true
-    coeffs:
-      total_energy: 1.0
-      forces: 1.0
-
-  val_metrics:
-    _target_: nequip.train.EnergyForceMetrics
-    coeffs:
-      per_atom_energy_mae: 1.0
-      forces_mae: 1.0
-      per_atom_energy_rmse: 1.0
-      forces_rmse: 1.0
-  train_metrics: ${training_module.val_metrics}
-  test_metrics: ${training_module.val_metrics}
-
-  optimizer:
-    _target_: torch.optim.Adam
-    lr: 5.0e-3
-    amsgrad: true
-
-  lr_scheduler:
-    scheduler:
-      _target_: torch.optim.lr_scheduler.ReduceLROnPlateau
-      factor: 0.5
-      patience: 50
-      threshold: 1.0e-3
-      min_lr: 1.0e-6
-    monitor: ${monitored_metric}
-    interval: epoch
-    frequency: 1
-
-  model:
-    _target_: nequip.model.NequIPGNNModel
-    seed: 42
-    model_dtype: float32
-    type_names: ${model_type_names}
-    r_max: ${cutoff_radius}
-
-    num_bessels: 8
-    bessel_trainable: true
-    polynomial_cutoff_p: 6
-
-    num_layers: ${num_layers}
-    l_max: ${l_max}
-    parity: true
-    num_features: ${num_features}
-
-    radial_mlp_depth: 3
-    radial_mlp_width: 64
-
-    avg_num_neighbors: ${training_data_stats:num_neighbors_mean}
-    per_type_energy_scales: ${training_data_stats:per_type_forces_rms}
-    per_type_energy_shifts: ${training_data_stats:per_atom_energy_mean}
-    per_type_energy_scales_trainable: false
-    per_type_energy_shifts_trainable: false
-
-
-# =====================
-#    GLOBAL OPTIONS
-# =====================
-# set_global_state(allow_tf32, warn_on_override) — that's the entire surface.
-# Seeds for data/model are set in their respective sections.
-global_options:
-  allow_tf32: true
+# NequIP's _unused_check otherwise hard-fails when wandb is disabled
+# (n_save_keep, wandb_project, wandb_resume become "unused"). Downgrade
+# to a warning so the run can actually start.
+warn_unused: true
