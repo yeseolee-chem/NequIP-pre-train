@@ -59,7 +59,7 @@ data:
   train_dataloader:
     _target_: torch.utils.data.DataLoader
     batch_size: 32
-    num_workers: 8
+    num_workers: 0   # eliminate dataloader subprocess fork — suspected source of hangs
     shuffle: true
     persistent_workers: true
   val_dataloader:
