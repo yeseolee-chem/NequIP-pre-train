@@ -82,7 +82,7 @@ data:
 trainer:
   _target_: lightning.Trainer
   accelerator: gpu
-  devices: 4                  # 4× RTX 3090 single node
+  devices: 2                  # reduced from 4 — startup hang loop with 4 GPUs
   # GLOO backend (TCP) instead of NCCL (InfiniBand). After 6 silent
   # multi-hour hangs across default DDP, SimpleDDPStrategy, and both n021
   # and n033 (all NCCL+IB), the consistent failure point is right after

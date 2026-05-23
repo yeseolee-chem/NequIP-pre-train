@@ -11,16 +11,12 @@
 # (RTX 3090 24GB) for memory headroom; gpu6 (A10 24GB) is a fallback.
 #SBATCH --partition=gpu1,gpu3,gpu4,gpu5,gpu6
 #SBATCH --nodes=1
-#SBATCH --gres=gpu:4
-# Exclude n021 — both 653760 and 653789 hung during startup (DDP init OK,
-# then complete silence until watchdog SIGKILL at 16min). Same node twice
-# suggests node-specific InfiniBand or NCCL state issue.
-#SBATCH --exclude=n021
-# 1 SLURM task per GPU — Lightning auto-detects SLURM_NTASKS as the
-# DDP world size. Earlier `--ntasks=1` reduced the DDP world size to 1
-# (job 649813 ran on a single GPU despite 4 being allocated).
-#SBATCH --ntasks-per-node=4
-#SBATCH --cpus-per-task=8
+#SBATCH --gres=gpu:2
+# n021 + n033 both produced startup hangs with 4-GPU DDP; reducing to
+# 2 GPUs to lower collective complexity. config trainer.devices=2 must
+# match this value.
+#SBATCH --ntasks-per-node=2
+#SBATCH --cpus-per-task=16
 #SBATCH --mem=128G
 #SBATCH --time=48:00:00
 #SBATCH --output=output/halo8_nequip_v1/logs/slurm/job-%j.out
