@@ -82,16 +82,9 @@ data:
 trainer:
   _target_: lightning.Trainer
   accelerator: gpu
-  devices: 2                  # reduced from 4 — startup hang loop with 4 GPUs
-  # GLOO backend (TCP) instead of NCCL (InfiniBand). After 6 silent
-  # multi-hour hangs across default DDP, SimpleDDPStrategy, and both n021
-  # and n033 (all NCCL+IB), the consistent failure point is right after
-  # `All distributed processes registered. NCCL version 2.19.3+cuda11.0`
-  # — i.e. the first NCCL collective. GLOO routes collectives over TCP
-  # and is slower (~1.5× per epoch) but doesn't depend on IB.
-  strategy:
-    _target_: lightning.pytorch.strategies.DDPStrategy
-    process_group_backend: gloo
+  devices: 1                  # single GPU — DDP+resume hangs reproducible
+                              # across 4/2 GPUs, NCCL/GLOO, multiple nodes
+  strategy: auto
   precision: 32-true
   enable_checkpointing: true
   max_epochs: 200

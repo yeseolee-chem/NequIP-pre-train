@@ -11,11 +11,10 @@
 # (RTX 3090 24GB) for memory headroom; gpu6 (A10 24GB) is a fallback.
 #SBATCH --partition=gpu1,gpu3,gpu4,gpu5,gpu6
 #SBATCH --nodes=1
-#SBATCH --gres=gpu:2
-# n021 + n033 both produced startup hangs with 4-GPU DDP; reducing to
-# 2 GPUs to lower collective complexity. config trainer.devices=2 must
-# match this value.
-#SBATCH --ntasks-per-node=2
+#SBATCH --gres=gpu:1
+# DDP+ckpt resume reproducibly hangs at startup (4 GPU, 2 GPU, NCCL+IB,
+# GLOO+TCP, multiple nodes). Fall back to single GPU: no DDP at all.
+#SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=128G
 #SBATCH --time=48:00:00
