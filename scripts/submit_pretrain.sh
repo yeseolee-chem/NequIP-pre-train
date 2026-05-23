@@ -148,9 +148,13 @@ echo "[$(date)] nequip-train pid=$TRAIN_PID"
 # SimpleDDPStrategy's manual all_reduce). Detect by training.log mtime
 # staleness and force-kill srun + ranks; the main `wait` then returns
 # non-zero and the auto-resubmit block at the end of this script fires.
-STALE_THRESHOLD=900   # 15 min without log update => hang
+STALE_THRESHOLD=3600  # 60 min without log update => hang (was 900s but
+                      # NequIP 0.9.x's stats computation on 3M frames
+                      # silently runs for ~30-45min; legitimate runs were
+                      # being killed mid-stats. Real hangs (resume + fit
+                      # frozen) take hours so 60min still catches them.
 (
-    sleep 600  # grace period for setup / dataset stats
+    sleep 1200  # grace period for setup / dataset stats (was 600s)
     while kill -0 "$TRAIN_PID" 2>/dev/null; do
         sleep 60
         if [ ! -f "$WORK_DIR/logs/training.log" ]; then continue; fi
