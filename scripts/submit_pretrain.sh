@@ -12,6 +12,10 @@
 #SBATCH --partition=gpu1,gpu3,gpu4,gpu5,gpu6
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:4
+# Exclude n021 — both 653760 and 653789 hung during startup (DDP init OK,
+# then complete silence until watchdog SIGKILL at 16min). Same node twice
+# suggests node-specific InfiniBand or NCCL state issue.
+#SBATCH --exclude=n021
 # 1 SLURM task per GPU — Lightning auto-detects SLURM_NTASKS as the
 # DDP world size. Earlier `--ntasks=1` reduced the DDP world size to 1
 # (job 649813 ran on a single GPU despite 4 being allocated).
