@@ -144,9 +144,36 @@ srun --ntasks-per-node=$SLURM_NTASKS_PER_NODE --cpus-per-task=$SLURM_CPUS_PER_TA
 TRAIN_PID=$!
 echo "[$(date)] nequip-train pid=$TRAIN_PID"
 
+# In-job hang watchdog: silent NCCL deadlocks have repeatedly hung the
+# chain for hours (NCCL_TIMEOUT/TORCH_NCCL_* did not fire, neither did
+# SimpleDDPStrategy's manual all_reduce). Detect by training.log mtime
+# staleness and force-kill srun + ranks; the main `wait` then returns
+# non-zero and the auto-resubmit block at the end of this script fires.
+STALE_THRESHOLD=900   # 15 min without log update => hang
+(
+    sleep 600  # grace period for setup / dataset stats
+    while kill -0 "$TRAIN_PID" 2>/dev/null; do
+        sleep 60
+        if [ ! -f "$WORK_DIR/logs/training.log" ]; then continue; fi
+        AGE=$(( $(date +%s) - $(stat -c %Y "$WORK_DIR/logs/training.log" 2>/dev/null || date +%s) ))
+        if [ "$AGE" -gt "$STALE_THRESHOLD" ]; then
+            echo "[$(date)] HANG WATCHDOG: training.log stale for ${AGE}s — force-killing srun (PID $TRAIN_PID)"
+            kill -SIGTERM "$TRAIN_PID" 2>/dev/null || true
+            sleep 30
+            kill -SIGKILL "$TRAIN_PID" 2>/dev/null || true
+            pkill -9 -u "$USER" -f "nequip-train" 2>/dev/null || true
+            break
+        fi
+    done
+) &
+WATCHDOG_PID=$!
+
 EXIT_CODE=0
 wait "$TRAIN_PID" || EXIT_CODE=$?
 echo "[$(date)] nequip-train exited with code $EXIT_CODE"
+
+# Stop watchdog regardless of exit path
+kill "$WATCHDOG_PID" 2>/dev/null || true
 
 if [ -f "$DONE_FLAG" ]; then
     echo "[$(date)] DONE_FLAG present — stopping chain"
