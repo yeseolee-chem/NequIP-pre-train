@@ -44,15 +44,17 @@ echo "[$(date)] python=$(which python)  nequip-train=$(which nequip-train)"
 # TF32 — propagated to the launcher
 export NEQUIP_ENABLE_TF32=1
 
-# Compute-node /tmp can fill up to 100% from other users' jobs (observed
-# on n007 — caused two torch.save zipfile pos-mismatch crashes during
-# epoch 5 trainer.pth save). NequIP's atomic_write defaults TMPDIR to
-# /tmp; redirect to our /gpfs project area so atomic_write always has
-# space. trainer.pth is ~60 MB so this is negligible quota cost.
-TMP_LOCAL="$WORK_DIR/tmp_atomicwrite"
+# /tmp on n007 was 100% full → torch.save zipfile pos-mismatch crashes.
+# Redirected TMPDIR to /gpfs subdir, but that path (~88 chars) exceeds the
+# 108-char Unix socket limit used by Python's multiprocessing for
+# DataLoader workers → 'OSError: AF_UNIX path too long'.
+# /dev/shm is short, RAM-backed, per-node ephemeral — perfect for atomic
+# writes and dataloader IPC.
+TMP_LOCAL="/dev/shm/nq_${SLURM_JOB_ID:-$$}"
 mkdir -p "$TMP_LOCAL"
 export TMPDIR="$TMP_LOCAL"
-echo "[$(date)] TMPDIR redirected to $TMPDIR (avoid /tmp on compute node)"
+echo "[$(date)] TMPDIR=$TMPDIR (short path, RAM-backed)"
+trap 'rm -rf "$TMP_LOCAL" 2>/dev/null || true' EXIT
 
 TRAIN_PID=""
 graceful_exit() {
