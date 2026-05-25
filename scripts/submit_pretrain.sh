@@ -44,6 +44,16 @@ echo "[$(date)] python=$(which python)  nequip-train=$(which nequip-train)"
 # TF32 — propagated to the launcher
 export NEQUIP_ENABLE_TF32=1
 
+# Compute-node /tmp can fill up to 100% from other users' jobs (observed
+# on n007 — caused two torch.save zipfile pos-mismatch crashes during
+# epoch 5 trainer.pth save). NequIP's atomic_write defaults TMPDIR to
+# /tmp; redirect to our /gpfs project area so atomic_write always has
+# space. trainer.pth is ~60 MB so this is negligible quota cost.
+TMP_LOCAL="$WORK_DIR/tmp_atomicwrite"
+mkdir -p "$TMP_LOCAL"
+export TMPDIR="$TMP_LOCAL"
+echo "[$(date)] TMPDIR redirected to $TMPDIR (avoid /tmp on compute node)"
+
 TRAIN_PID=""
 graceful_exit() {
     echo "[$(date)] === SIGUSR1 received — graceful shutdown ==="
