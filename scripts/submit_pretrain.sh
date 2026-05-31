@@ -2,8 +2,10 @@
 # Halo8 NequIP pretraining — auto-resubmitting SLURM driver (Spec v5 §6).
 
 #SBATCH --job-name=halo8_nequip
-#SBATCH --partition=gpu1
-#SBATCH --gres=gpu:rtx3090:1
+# Multi-partition + generic gres so SLURM picks any free GPU slot
+# (was gpu1+rtx3090 only → 2-day priority queue wait observed for 660083).
+#SBATCH --partition=gpu1,gpu3,gpu4,gpu5,gpu6
+#SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
 #SBATCH --time=48:00:00
