@@ -12,7 +12,7 @@
 #
 # Paths below are absolute so cwd changes in submit_pretrain.sh don't
 # silently break dataset resolution.
-root: /gpfs/home1/yeseo1ee/projects/halo8-nequip-pretrain/output/halo8_nequip_v1
+root: /gpfs/home1/yeseo1ee/projects/eda-asm-prediction/NequIP/output/halo8_nequip_v1
 run_name: training_run
 seed: 42
 dataset_seed: 42
@@ -21,10 +21,10 @@ default_dtype: float32
 # ===== Dataset =====
 dataset: ase
 dataset_file_name: 
-  /gpfs/home1/yeseo1ee/projects/halo8-nequip-pretrain/output/halo8_nequip_v1/data/halo8_train.extxyz
+  /gpfs/home1/yeseo1ee/projects/eda-asm-prediction/NequIP/output/halo8_nequip_v1/data/halo8_train.extxyz
 validation_dataset: ase
 validation_dataset_file_name: 
-  /gpfs/home1/yeseo1ee/projects/halo8-nequip-pretrain/output/halo8_nequip_v1/data/halo8_val.extxyz
+  /gpfs/home1/yeseo1ee/projects/eda-asm-prediction/NequIP/output/halo8_nequip_v1/data/halo8_val.extxyz
 chemical_symbols: [H, C, N, O, F, S, Cl, Br]
 key_mapping:
   energy: total_energy

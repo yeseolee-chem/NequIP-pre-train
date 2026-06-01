@@ -15,7 +15,7 @@
 
 set -euo pipefail
 
-PROJECT_DIR="/gpfs/home1/yeseo1ee/projects/halo8-nequip-pretrain"
+PROJECT_DIR="/gpfs/home1/yeseo1ee/projects/eda-asm-prediction/NequIP"
 WORK_DIR="$PROJECT_DIR/output/halo8_nequip_v1"
 CONFIG="$PROJECT_DIR/configs/halo8_nequip_v1.yaml"
 DONE_FLAG="$WORK_DIR/training_complete.flag"
